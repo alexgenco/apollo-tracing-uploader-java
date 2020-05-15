@@ -6,6 +6,8 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
@@ -23,25 +25,31 @@ import graphql.execution.instrumentation.parameters.InstrumentationExecutionPara
 import graphql.execution.instrumentation.parameters.InstrumentationFieldFetchParameters;
 import graphql.language.AstPrinter;
 import graphql.language.AstSignature;
+import graphql.schema.GraphQLTypeUtil;
 import mdg.engine.proto.Reports;
 
 public class TracingUploadInstrumentationState implements InstrumentationState {
   private final Gson gson = new Gson();
-  private BiConsumer<Reports.Trace.Builder, Object> customizeTrace;
+  private final TraceProducer producer;
+  private final BiConsumer<Reports.Trace.Builder, Object> customizeTrace;
   private final VariablesSanitizer sanitizeVariables;
   private final Reports.Trace.Builder proto;
+  private final Map<NodePath, Reports.Trace.Node> nodePathsToNodes;
   private final long startRequestNs;
   private Object context;
   public final boolean noop;
 
-  public TracingUploadInstrumentationState(BiConsumer<Reports.Trace.Builder, Object> customizeTrace,
+  public TracingUploadInstrumentationState(TraceProducer producer,
+                                           BiConsumer<Reports.Trace.Builder, Object> customizeTrace,
                                            VariablesSanitizer sanitizeVariables,
                                            boolean noop) {
+    this.producer = producer;
     this.customizeTrace = customizeTrace;
     this.sanitizeVariables = sanitizeVariables;
     this.proto = Reports.Trace.newBuilder();
     this.startRequestNs = System.nanoTime();
     this.context = null;
+    this.nodePathsToNodes = new ConcurrentHashMap<>();
     this.noop = noop;
   }
 
@@ -111,21 +119,31 @@ public class TracingUploadInstrumentationState implements InstrumentationState {
       long now = System.nanoTime();
       long durationNs = now - startFieldFetchNs;
 
-      Reports.Trace.Node.Builder rootNode = proto.getRootBuilder();
       NodePath path = NodePath.fromList(stepInfo.getPath().toList());
 
-      path.getChild(rootNode)
+      Reports.Trace.Node childNode = Reports.Trace.Node.newBuilder()
         .setOriginalFieldName(stepInfo.getFieldDefinition().getName())
         .setType(stepInfo.simplePrint())
-        .setParentType(stepInfo.getParent().getUnwrappedNonNullType().getName())
+        .setParentType(GraphQLTypeUtil.simplePrint(stepInfo.getParent().getUnwrappedNonNullType()))
         .setStartTime(offsetNs)
-        .setEndTime(offsetNs + durationNs);
+        .setEndTime(offsetNs + durationNs)
+        .build();
+
+      nodePathsToNodes.put(path, childNode);
     });
   }
 
-  public Reports.Trace build() {
+  public CompletableFuture<ExecutionResult> instrumentExecutionResult(ExecutionResult executionResult) {
+    populateRootNode();
     customizeTrace.accept(proto, context);
-    return proto.build();
+    producer.submit(proto.build());
+
+    return CompletableFuture.completedFuture(executionResult);
+  }
+
+  private void populateRootNode() {
+    Reports.Trace.Node.Builder rootNode = proto.getRootBuilder();
+    nodePathsToNodes.forEach((path, node) -> path.getChild(rootNode).mergeFrom(node));
   }
 
   private Timestamp protoTimestamp(Instant instant) {
